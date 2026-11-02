@@ -1,0 +1,47 @@
+name: Public release checksum and optional VirusTotal
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Already public binary distribution repository (owner/name)
+        required: true
+        type: string
+      tag:
+        description: Published stable tag (v0.1.0-1)
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      repository:
+        required: true
+        type: string
+      tag:
+        required: true
+        type: string
+    secrets:
+      VIRUSTOTAL_API_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  public-release:
+    # Never submit a private source release. A public distribution repo may call this workflow.
+    if: github.event_name != 'release' || (github.event.repository.private == false && github.event.release.prerelease == false)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Validate public DMG and optionally submit to VirusTotal
+        env:
+          RELEASE_REPOSITORY: ${{ inputs.repository || github.repository }}
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+        run: python3 scripts/scan_public_release.py "$RELEASE_REPOSITORY" "$RELEASE_TAG"
