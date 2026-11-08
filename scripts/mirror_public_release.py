@@ -140,9 +140,11 @@ def main():
     parser.add_argument("tag")
     args = parser.parse_args()
     version, build, assets = release_assets(args.tag)
+    print(f"Validated public stable release metadata: {args.tag}", flush=True)
     with tempfile.TemporaryDirectory(prefix="tolmatch-mirror-") as directory:
         path = Path(directory)
         validate_package(args.tag, version, build, assets, path)
+        print("Verified all four GitHub downloads and package metadata", flush=True)
         mirror(args.tag, assets, path)
 
 
@@ -150,4 +152,11 @@ if __name__ == "__main__":
     try:
         main()
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
-        raise SystemExit(f"Release mirror failed ({type(error).__name__}); no readiness is asserted.") from None
+        detail = type(error).__name__
+        if isinstance(error, HTTPError):
+            detail += f" HTTP {error.code}"
+        elif isinstance(error, subprocess.CalledProcessError):
+            code = re.search(rb"An error occurred \(([A-Za-z0-9]{1,64})\)", error.stderr or b"")
+            if code:
+                detail += " S3 " + code[1].decode("ascii")
+        raise SystemExit(f"Release mirror failed ({detail}); no readiness is asserted.") from None
