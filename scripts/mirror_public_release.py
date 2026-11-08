@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Mirror a published stable Tolmatch release to Yandex S3; never publish a release."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import tempfile
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+import scan_public_release as public
+
+REPOSITORY = "AlexMihaa/tolmatch-releases"
+BUCKET = "tolmatch-public"
+ORIGIN = f"https://storage.yandexcloud.net/{BUCKET}/"
+CDN = "https://cdn.tolmatch.app/"
+MIME = {".dmg": "application/x-apple-diskimage", ".sha256": "text/plain; charset=utf-8",
+        ".json": "application/json", ".xml": "application/xml"}
+MAX_METADATA_BYTES = 1024 * 1024
+
+
+def release_assets(tag):
+    match = re.fullmatch(r"v([0-9]+\.[0-9]+(?:\.[0-9]+)?)-([1-9][0-9]{0,9})", tag)
+    if not match:
+        raise ValueError("expected a canonical stable release tag")
+    info = public.read_json(f"https://api.github.com/repos/{REPOSITORY}")
+    if info.get("private") is not False or info.get("visibility") != "public":
+        raise ValueError("distribution repository must be public")
+    release = public.read_json(f"https://api.github.com/repos/{REPOSITORY}/releases/tags/{tag}")
+    if (release.get("draft") is not False or release.get("prerelease") is not False
+            or release.get("tag_name") != tag or not release.get("published_at")):
+        raise ValueError("only published stable releases may be mirrored")
+    names = [f"Tolmatch-{match[1]}.dmg", f"Tolmatch-{match[1]}.dmg.sha256",
+             "tolmatch-release.json", "appcast.xml"]
+    assets = []
+    for name in names:
+        found = [a for a in release.get("assets", []) if a.get("name") == name]
+        if len(found) != 1:
+            raise ValueError("release lacks exactly four canonical assets")
+        asset = found[0]
+        expected = f"https://github.com/{REPOSITORY}/releases/download/{tag}/{name}"
+        limit = public.MAX_FILE_BYTES if name.endswith(".dmg") else MAX_METADATA_BYTES
+        size = asset.get("size")
+        if (asset.get("state") != "uploaded" or asset.get("browser_download_url") != expected
+                or not re.fullmatch(r"sha256:[a-f0-9]{64}", asset.get("digest") or "")
+                or type(size) is not int or not 0 < size <= limit):
+            raise ValueError("invalid release asset URL, digest or size")
+        assets.append(asset)
+    return match[1], match[2], assets
+
+
+def validate_package(tag, version, build, assets, directory):
+    """All source bytes are verified before the first authenticated S3 operation."""
+    for asset in assets:
+        public.download(asset, directory / asset["name"])
+    dmg = assets[0]
+    sha = dmg["digest"].removeprefix("sha256:")
+    checksum = (directory / assets[1]["name"]).read_text().strip()
+    if checksum != f"{sha}  {dmg['name']}":
+        raise ValueError("checksum file does not match the installer")
+    metadata = json.loads((directory / "tolmatch-release.json").read_text())
+    expected = {"tag": tag, "version": version, "build": build, "file": dmg["name"],
+                "sizeBytes": dmg["size"], "sha256": sha, "sourceTreeDirty": False,
+                "prerelease": False, "channel": "production-self-signed",
+                "automaticUpdates": True, "appcastFile": "appcast.xml"}
+    if any(type(metadata.get(k)) is not type(v) or metadata[k] != v for k, v in expected.items()):
+        raise ValueError("release metadata does not match the canonical stable package")
+
+
+def object_digest(key, limit):
+    """Read anonymously from the origin, bypassing CDN negative/old caches."""
+    try:
+        with urlopen(Request(ORIGIN + key, headers={"User-Agent": "Tolmatch-release-mirror"}), timeout=60) as response:
+            if response.status != 200 or response.geturl() != ORIGIN + key:
+                raise ValueError("unexpected object response")
+            digest = hashlib.sha256()
+            size = 0
+            while block := response.read(1024 * 1024):
+                size += len(block)
+                if size > limit:
+                    raise ValueError("existing object exceeds the expected size")
+                digest.update(block)
+            return size, "sha256:" + digest.hexdigest()
+    except HTTPError as error:
+        if error.code == 404:
+            return None
+        raise
+
+
+def upload(path, key, digest):
+    """AWS CLI signs HTTPS S3 requests; credentials stay in the environment."""
+    if not os.environ.get("AWS_ACCESS_KEY_ID") or not os.environ.get("AWS_SECRET_ACCESS_KEY"):
+        raise ValueError("publisher credentials are not configured")
+    environment = dict(os.environ, AWS_EC2_METADATA_DISABLED="true", AWS_DEFAULT_REGION="ru-central1",
+                       AWS_REQUEST_CHECKSUM_CALCULATION="when_required", AWS_RESPONSE_CHECKSUM_VALIDATION="when_required")
+    command = ["aws", "--endpoint-url", "https://storage.yandexcloud.net", "--no-cli-pager",
+               "s3api", "put-object", "--bucket", BUCKET, "--key", key, "--body", str(path),
+               "--content-type", MIME[path.suffix], "--cache-control", "public,max-age=31536000,immutable",
+               "--metadata", json.dumps({"sha256": digest.removeprefix("sha256:")})]
+    # Never echo subprocess errors: SDK diagnostics can contain request details.
+    subprocess.run(command, env=environment, check=True, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.PIPE, timeout=300)
+
+
+def mirror(tag, assets, directory, put=upload, read=object_digest):
+    prefix = f"releases/{tag}/"
+    # Preflight every destination before writing, so conflicts cannot cause partial overwrites.
+    for asset in assets:
+        previous = read(prefix + asset["name"], asset["size"])
+        if previous is not None and previous != (asset["size"], asset["digest"]):
+            raise ValueError("refusing to overwrite different versioned bytes")
+    for asset in assets:
+        key = prefix + asset["name"]
+        # Identical files may be PUT again to apply correct MIME/cache metadata, including manual bootstrap copies.
+        put(directory / asset["name"], key, asset["digest"])
+        if read(key, asset["size"]) != (asset["size"], asset["digest"]):
+            raise ValueError("public mirror verification failed")
+        print(f"Verified: {key} ({asset['size']} bytes)")
+    manifest = {"schemaVersion": 1, "repository": REPOSITORY, "tag": tag,
+                "files": [{"name": a["name"], "sizeBytes": a["size"],
+                           "sha256": a["digest"].removeprefix("sha256:"),
+                           "url": CDN + prefix + a["name"]} for a in assets]}
+    path = directory / "mirror.json"
+    path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+    expected = (path.stat().st_size, "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest())
+    previous = read(prefix + path.name, expected[0])
+    if previous is not None and previous != expected:
+        raise ValueError("existing completion marker conflicts with the release")
+    put(path, prefix + path.name, expected[1])
+    if read(prefix + path.name, expected[0]) != expected:
+        raise ValueError("completion marker verification failed")
+    print(f"Mirror ready: {CDN}{prefix}mirror.json")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("tag")
+    args = parser.parse_args()
+    version, build, assets = release_assets(args.tag)
+    with tempfile.TemporaryDirectory(prefix="tolmatch-mirror-") as directory:
+        path = Path(directory)
+        validate_package(args.tag, version, build, assets, path)
+        mirror(args.tag, assets, path)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        raise SystemExit(f"Release mirror failed ({type(error).__name__}); no readiness is asserted.") from None

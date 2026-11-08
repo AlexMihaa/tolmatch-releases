@@ -1,0 +1,42 @@
+name: Mirror stable release to Yandex
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Already published stable tag (for example v0.1.9-12)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: yandex-release-mirror-${{ inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: >-
+      github.repository == 'AlexMihaa/tolmatch-releases' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.repository.private == false && github.event.release.prerelease == false && github.event.release.draft == false))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Test mirror validation
+        run: python3 -m unittest discover -s scripts -p 'test_mirror_public_release.py' -v
+      - name: Mirror and verify the published release
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.YANDEX_RELEASES_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.YANDEX_RELEASES_SECRET_ACCESS_KEY }}
+        run: |
+          command -v aws >/dev/null
+          python3 scripts/mirror_public_release.py "$RELEASE_TAG"
