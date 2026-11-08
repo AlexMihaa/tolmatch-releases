@@ -35,8 +35,10 @@ jobs:
       - name: Mirror and verify the published release
         env:
           RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          GH_TOKEN: ${{ github.token }}
           AWS_ACCESS_KEY_ID: ${{ secrets.YANDEX_RELEASES_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.YANDEX_RELEASES_SECRET_ACCESS_KEY }}
         run: |
           command -v aws >/dev/null
+          command -v gh >/dev/null
           python3 scripts/mirror_public_release.py "$RELEASE_TAG"

@@ -20,9 +20,9 @@ def fixture():
     blobs = {"Tolmatch-0.1.9.dmg": b"installer",
              "Tolmatch-0.1.9.dmg.sha256": f"{sha}  Tolmatch-0.1.9.dmg\n".encode(),
              "tolmatch-release.json": json.dumps(meta).encode(), "appcast.xml": b"signed feed bytes"}
-    assets = [{"name": name, "size": len(body), "digest": "sha256:" + hashlib.sha256(body).hexdigest(),
+    assets = [{"id": i + 1, "name": name, "size": len(body), "digest": "sha256:" + hashlib.sha256(body).hexdigest(),
                "state": "uploaded", "browser_download_url": f"https://github.com/{mirror.REPOSITORY}/releases/download/v0.1.9-12/{name}"}
-              for name, body in blobs.items()]
+              for i, (name, body) in enumerate(blobs.items())]
     release = {"tag_name": "v0.1.9-12", "published_at": "2026-11-06T00:00:00Z",
                "draft": False, "prerelease": False, "assets": assets}
     return blobs, assets, release
@@ -57,7 +57,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
         cases = []
         bad = copy.deepcopy(release); bad["assets"].pop(); cases.append(bad)
         bad = copy.deepcopy(release); bad["assets"].append(bad["assets"][0]); cases.append(bad)
-        for field, value in [("digest", None), ("size", True), ("size", -1), ("state", "new"),
+        for field, value in [("id", "foreign"), ("digest", None), ("size", True), ("size", -1), ("state", "new"),
                              ("browser_download_url", "https://attacker.invalid/file")]:
             bad = copy.deepcopy(release); bad["assets"][0][field] = value; cases.append(bad)
         for bad in cases:
@@ -71,8 +71,17 @@ class ReleaseBoundaryTests(unittest.TestCase):
 
     def test_package_rejects_tampered_download(self):
         _, assets, _ = fixture()
-        with tempfile.TemporaryDirectory() as tmp, patch.object(mirror.public, "urlopen", return_value=io.BytesIO(b"tampered")):
+        def fake_cli(command, **kwargs): kwargs["stdout"].write(b"tampered")
+        with tempfile.TemporaryDirectory() as tmp, patch.object(mirror.subprocess, "run", side_effect=fake_cli):
             with self.assertRaises(ValueError): mirror.validate_package("v0.1.9-12", "0.1.9", "12", assets, Path(tmp))
+
+    def test_asset_download_uses_official_api_and_verifies_bytes(self):
+        blobs, assets, _ = fixture()
+        def fake_cli(command, **kwargs): kwargs["stdout"].write(blobs[assets[0]["name"]])
+        with tempfile.TemporaryDirectory() as tmp, patch.object(mirror.subprocess, "run", side_effect=fake_cli) as run:
+            mirror.download_asset(assets[0], Path(tmp) / assets[0]["name"])
+            self.assertEqual(run.call_args.args[0][-1], f"repos/{mirror.REPOSITORY}/releases/assets/1")
+            self.assertIn("Accept: application/octet-stream", run.call_args.args[0])
 
     def test_metadata_and_checksum_must_match_installer(self):
         for target in ["checksum", "sha256", "sourceTreeDirty", "build", "sizeBytes"]:
@@ -83,7 +92,7 @@ class ReleaseBoundaryTests(unittest.TestCase):
                 meta[target] = True if target == "sourceTreeDirty" else "wrong"
                 blobs["tolmatch-release.json"] = json.dumps(meta).encode()
             def download(asset, path): path.write_bytes(blobs[asset["name"]])
-            with self.subTest(target=target), tempfile.TemporaryDirectory() as tmp, patch.object(mirror.public, "download", side_effect=download):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as tmp, patch.object(mirror, "download_asset", side_effect=download):
                 with self.assertRaises(ValueError): mirror.validate_package("v0.1.9-12", "0.1.9", "12", assets, Path(tmp))
 
 

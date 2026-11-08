@@ -44,7 +44,8 @@ def release_assets(tag):
         expected = f"https://github.com/{REPOSITORY}/releases/download/{tag}/{name}"
         limit = public.MAX_FILE_BYTES if name.endswith(".dmg") else MAX_METADATA_BYTES
         size = asset.get("size")
-        if (asset.get("state") != "uploaded" or asset.get("browser_download_url") != expected
+        if (type(asset.get("id")) is not int or asset["id"] < 1
+                or asset.get("state") != "uploaded" or asset.get("browser_download_url") != expected
                 or not re.fullmatch(r"sha256:[a-f0-9]{64}", asset.get("digest") or "")
                 or type(size) is not int or not 0 < size <= limit):
             raise ValueError("invalid release asset URL, digest or size")
@@ -52,10 +53,29 @@ def release_assets(tag):
     return match[1], match[2], assets
 
 
+def download_asset(asset, path):
+    # GitHub's website download route can return 504 even inside Actions. Use
+    # its official asset API via gh, which handles binary responses/redirects.
+    command = ["gh", "api", "--method", "GET", "-H", "Accept: application/octet-stream",
+               f"repos/{REPOSITORY}/releases/assets/{asset['id']}"]
+    with path.open("wb") as output:
+        subprocess.run(command, stdout=output, stderr=subprocess.PIPE, check=True, timeout=180)
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        while block := stream.read(1024 * 1024):
+            size += len(block)
+            if size > asset["size"]:
+                raise ValueError("download exceeds advertised asset size")
+            digest.update(block)
+    if size != asset["size"] or "sha256:" + digest.hexdigest() != asset["digest"]:
+        raise ValueError("asset API download differs from published GitHub digest")
+
+
 def validate_package(tag, version, build, assets, directory):
     """All source bytes are verified before the first authenticated S3 operation."""
     for asset in assets:
-        public.download(asset, directory / asset["name"])
+        download_asset(asset, directory / asset["name"])
     dmg = assets[0]
     sha = dmg["digest"].removeprefix("sha256:")
     checksum = (directory / assets[1]["name"]).read_text().strip()
@@ -159,4 +179,7 @@ if __name__ == "__main__":
             code = re.search(rb"An error occurred \(([A-Za-z0-9]{1,64})\)", error.stderr or b"")
             if code:
                 detail += " S3 " + code[1].decode("ascii")
+            status = re.search(rb"HTTP ([0-9]{3})", error.stderr or b"")
+            if status:
+                detail += " upstream HTTP " + status[1].decode("ascii")
         raise SystemExit(f"Release mirror failed ({detail}); no readiness is asserted.") from None
