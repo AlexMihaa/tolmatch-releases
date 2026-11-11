@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mirror a published stable Tolmatch release to Yandex S3; never publish a release."""
+"""Mirror a published stable Tolmatch release to Timeweb S3; never publish a release."""
 import argparse
 import hashlib
 import json
@@ -15,10 +15,13 @@ import scan_public_release as public
 
 REPOSITORY = "AlexMihaa/tolmatch-releases"
 BUCKET = "tolmatch-public"
-ORIGIN = f"https://storage.yandexcloud.net/{BUCKET}/"
+ENDPOINT = "https://s3.twcstorage.ru"
+REGION = "ru-1"
+ORIGIN = f"{ENDPOINT}/{BUCKET}/"
 CDN = "https://cdn.tolmatch.app/"
 MIME = {".dmg": "application/x-apple-diskimage", ".sha256": "text/plain; charset=utf-8",
-        ".json": "application/json", ".xml": "application/xml"}
+        ".json": "application/json", ".xml": "application/xml",
+        ".mp4": "video/mp4", ".jpg": "image/jpeg", ".vtt": "text/vtt; charset=utf-8"}
 MAX_METADATA_BYTES = 1024 * 1024
 
 
@@ -90,6 +93,36 @@ def validate_package(tag, version, build, assets, directory):
         raise ValueError("release metadata does not match the canonical stable package")
 
 
+def s3_environment():
+    if not os.environ.get("AWS_ACCESS_KEY_ID") or not os.environ.get("AWS_SECRET_ACCESS_KEY"):
+        raise ValueError("publisher credentials are not configured")
+    return dict(os.environ, AWS_EC2_METADATA_DISABLED="true", AWS_DEFAULT_REGION=REGION,
+                AWS_REQUEST_CHECKSUM_CALCULATION="when_required",
+                AWS_RESPONSE_CHECKSUM_VALIDATION="when_required")
+
+
+def key_exists(key):
+    """An anonymous S3 403 can mean no key, but is never sufficient evidence itself."""
+    if not key.startswith(("releases/", "site-media/")) or any(p in ("", ".", "..") for p in key.split("/")):
+        raise ValueError("unexpected public object key")
+    command = ["aws", "--endpoint-url", ENDPOINT, "--no-cli-pager", "s3api", "list-objects-v2",
+               "--bucket", BUCKET, "--prefix", key, "--max-keys", "2", "--no-paginate", "--output", "json"]
+    result = subprocess.run(command, env=s3_environment(), check=True, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, timeout=60)
+    if len(result.stdout) > 64 * 1024:
+        raise ValueError("oversized existence response")
+    listing = json.loads(result.stdout)
+    contents = listing.get("Contents", [])
+    if not isinstance(contents, list) or any(not isinstance(item, dict) or not isinstance(item.get("Key"), str)
+                                            or not item["Key"].startswith(key) for item in contents):
+        raise ValueError("invalid existence response")
+    if any(item["Key"] == key for item in contents):
+        return True
+    if listing.get("IsTruncated") is not False or listing.get("KeyCount") != len(contents):
+        raise ValueError("incomplete existence response")
+    return False
+
+
 def object_digest(key, limit):
     """Read anonymously from the origin, bypassing CDN negative/old caches."""
     try:
@@ -107,18 +140,19 @@ def object_digest(key, limit):
     except HTTPError as error:
         if error.code == 404:
             return None
+        if (error.code == 403 and os.environ.get("AWS_ACCESS_KEY_ID")
+                and os.environ.get("AWS_SECRET_ACCESS_KEY") and not key_exists(key)):
+            return None
         raise
 
 
 def upload(path, key, digest):
     """AWS CLI signs HTTPS S3 requests; credentials stay in the environment."""
-    if not os.environ.get("AWS_ACCESS_KEY_ID") or not os.environ.get("AWS_SECRET_ACCESS_KEY"):
-        raise ValueError("publisher credentials are not configured")
-    environment = dict(os.environ, AWS_EC2_METADATA_DISABLED="true", AWS_DEFAULT_REGION="ru-central1",
-                       AWS_REQUEST_CHECKSUM_CALCULATION="when_required", AWS_RESPONSE_CHECKSUM_VALIDATION="when_required")
-    command = ["aws", "--endpoint-url", "https://storage.yandexcloud.net", "--no-cli-pager",
+    environment = s3_environment()
+    cache = "no-store,max-age=0" if key.endswith("/mirror.json") else "public,max-age=31536000,immutable"
+    command = ["aws", "--endpoint-url", ENDPOINT, "--no-cli-pager",
                "s3api", "put-object", "--bucket", BUCKET, "--key", key, "--body", str(path),
-               "--content-type", MIME[path.suffix], "--cache-control", "public,max-age=31536000,immutable",
+               "--content-type", MIME[path.suffix], "--cache-control", cache,
                "--metadata", json.dumps({"sha256": digest.removeprefix("sha256:")})]
     # Never echo subprocess errors: SDK diagnostics can contain request details.
     subprocess.run(command, env=environment, check=True, stdout=subprocess.DEVNULL,

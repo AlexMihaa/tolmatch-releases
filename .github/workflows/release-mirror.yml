@@ -1,4 +1,4 @@
-name: Mirror stable release to Yandex
+name: Mirror stable release to Timeweb
 
 on:
   release:
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: yandex-release-mirror-${{ inputs.tag || github.event.release.tag_name }}
+  group: public-release-mirror-${{ inputs.tag || github.event.release.tag_name }}
   cancel-in-progress: false
 
 jobs:
@@ -36,8 +36,8 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
           GH_TOKEN: ${{ github.token }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.YANDEX_RELEASES_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.YANDEX_RELEASES_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TIMEWEB_RELEASES_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TIMEWEB_RELEASES_SECRET_ACCESS_KEY }}
         run: |
           command -v aws >/dev/null
           command -v gh >/dev/null

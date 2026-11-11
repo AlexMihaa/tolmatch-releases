@@ -155,7 +155,8 @@ class MirrorTests(unittest.TestCase):
         with patch.dict("os.environ", {"AWS_ACCESS_KEY_ID": "test-access", "AWS_SECRET_ACCESS_KEY": "test-secret"}), patch.object(mirror.subprocess, "run") as run:
             mirror.upload(self.path / "appcast.xml", "releases/v0.1.9-12/appcast.xml", self.assets[-1]["digest"])
         args, kwargs = run.call_args
-        self.assertIn("https://storage.yandexcloud.net", args[0]); self.assertNotIn("test-secret", repr(args))
+        self.assertIn("https://s3.twcstorage.ru", args[0]); self.assertNotIn("test-secret", repr(args))
+        self.assertEqual(kwargs["env"]["AWS_DEFAULT_REGION"], "ru-1")
         self.assertEqual(kwargs["env"]["AWS_EC2_METADATA_DISABLED"], "true")
         self.assertEqual(kwargs["env"]["AWS_REQUEST_CHECKSUM_CALCULATION"], "when_required")
         self.assertEqual(kwargs["stderr"], mirror.subprocess.PIPE)
@@ -166,6 +167,36 @@ class MirrorTests(unittest.TestCase):
                 with self.assertRaises(HTTPError): mirror.object_digest("releases/x", 1)
         with patch.object(mirror, "urlopen", side_effect=HTTPError("url", 404, "error", {}, None)):
             self.assertIsNone(mirror.object_digest("releases/x", 1))
+
+    def test_403_requires_authenticated_exact_absence_not_an_assumption(self):
+        error = HTTPError("url", 403, "error", {}, None)
+        with patch.dict("os.environ", {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "secret"}):
+            with patch.object(mirror, "urlopen", side_effect=error), patch.object(mirror, "key_exists", return_value=False):
+                self.assertIsNone(mirror.object_digest("releases/v0.1.9-12/appcast.xml", 1))
+            with patch.object(mirror, "urlopen", side_effect=error), patch.object(mirror, "key_exists", return_value=True):
+                with self.assertRaises(HTTPError): mirror.object_digest("releases/v0.1.9-12/appcast.xml", 1)
+            with patch.object(mirror, "urlopen", side_effect=error), patch.object(mirror, "key_exists", side_effect=OSError("denied")):
+                with self.assertRaises(OSError): mirror.object_digest("releases/v0.1.9-12/appcast.xml", 1)
+
+    def test_existence_listing_fails_closed_and_uses_scoped_prefix(self):
+        key = "releases/v0.1.9-12/appcast.xml"
+        for listing, expected in [({"IsTruncated": False, "KeyCount": 0}, False),
+                                  ({"IsTruncated": False, "KeyCount": 1, "Contents": [{"Key": key}]}, True)]:
+            with patch.dict("os.environ", {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "secret"}), patch.object(mirror.subprocess, "run") as run:
+                run.return_value.stdout = json.dumps(listing).encode()
+                self.assertEqual(mirror.key_exists(key), expected)
+                self.assertEqual(run.call_args.args[0][run.call_args.args[0].index("--prefix") + 1], key)
+        for listing in [{}, {"IsTruncated": True, "KeyCount": 0}, {"IsTruncated": False, "KeyCount": 1},
+                        {"IsTruncated": False, "KeyCount": 1, "Contents": [{"Key": "foreign"}]}]:
+            with patch.dict("os.environ", {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "secret"}), patch.object(mirror.subprocess, "run") as run:
+                run.return_value.stdout = json.dumps(listing).encode()
+                with self.assertRaises(ValueError): mirror.key_exists(key)
+
+    def test_readiness_marker_is_not_cached_without_a_separate_cdn_rule(self):
+        path = self.path / "mirror.json"; path.write_text("{}")
+        with patch.dict("os.environ", {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "secret"}), patch.object(mirror.subprocess, "run") as run:
+            mirror.upload(path, "releases/v0.1.9-12/mirror.json", "sha256:" + "0" * 64)
+        self.assertIn("no-store,max-age=0", run.call_args.args[0])
 
 
 if __name__ == "__main__": unittest.main()
